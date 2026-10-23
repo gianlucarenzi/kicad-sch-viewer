@@ -10,7 +10,7 @@
 # WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
 # or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
 # (the LICENSE file) for more details.
-"""kicad_sch_viewer.py - a viewer for KiCad schematics, every version.
+"""KeSeV - the KiCad Schematic Viewer, every KiCad version.
 
 KiCad 4/5: "EESchema Schematic File Version 2..4" (.sch); the symbols come
 from the legacy libraries ("EESchema-LIBRARY Version 2.x"): the project's
@@ -20,8 +20,8 @@ KiCad 6, 7, 8, 9 and later: the S-expression .kicad_sch, symbols embedded
 in the file; project text variables from the .kicad_pro.
 The hierarchical sheets are followed in both.
 
-  kicad_sch_viewer.py board.sch [-L extra.lib ...]
-  kicad_sch_viewer.py board.sch --export out.png|out.pdf|out.svg [--sheet N]
+  kesev board.kicad_sch | board.sch [-L extra.lib ...]
+  kesev board.kicad_sch --export out.png|out.pdf|out.svg [--sheet N]
 
 Mouse: wheel = zoom, drag (left or middle) = pan, click = select a symbol
 (its fields in the panel), double-click a sheet = open it.
@@ -84,11 +84,11 @@ CANVAS = '#E8E8E8'                     # the scene around the page (set by the t
 
 # Everything the viewer uses lives next to this file: the fonts (fonts/,
 # DejaVu Sans for the drawings, Noto Sans for the window; their licences
-# are there too) and the settings (kicad_sch_viewer.ini).  Only PyQt5 comes
+# are there too) and the settings (kesev.ini).  Only PyQt5 comes
 # from the system.
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.realpath(__file__))   # through a symlink too
 FONT_DIR = os.path.join(HERE, 'fonts')
-SETTINGS_FILE = os.path.join(HERE, 'kicad_sch_viewer.ini')
+SETTINGS_FILE = os.path.join(HERE, 'kesev.ini')
 
 
 def load_fonts():
@@ -1408,7 +1408,10 @@ class Painter:
         for f in c.fields:
             if f.n in (1, 2, 3) and f.text:
                 info.append(f'{("Value", "Footprint", "Datasheet")[f.n - 1]}: {f.text}')
-        group.setToolTip('\n'.join(info))
+        tip = '\n'.join(info)
+        group.setToolTip(tip)
+        for ch in group.childItems():   # the pieces get the hover tip
+            ch.setToolTip(tip)
         group.setData(0, ('comp', c, ref, unit))
         group.setFlag(QGraphicsItem.ItemIsSelectable, True)
 
@@ -1806,6 +1809,7 @@ class Window(QMainWindow):
         self.addDockWidget(Qt.LeftDockWidgetArea, dock2)
         self.pos_label = QLabel()
         self.statusBar().addPermanentWidget(self.pos_label)
+        self.setWindowTitle('KeSeV')
         self.make_menu()
         self.make_toolbar()
         self.resize(1400, 900)
@@ -1871,7 +1875,7 @@ class Window(QMainWindow):
     # -- project / sheets -------------------------------------------------
     def set_project(self, project):
         self.project = project
-        self.setWindowTitle(f'{os.path.basename(project.root_path)} - KiCad schematic viewer')
+        self.setWindowTitle(f'{os.path.basename(project.root_path)} - KeSeV')
         self.tree.clear()
         self.tree_items = {}
 
@@ -1951,11 +1955,14 @@ class Window(QMainWindow):
                         return
 
     def comp_at(self, p):
+        """The symbol under p: its pieces are children of the symbol's group."""
         for it in self.view.scene().items(p):
-            g = it.group() or it
-            d = g.data(0)
-            if d and d[0] == 'comp':
-                return g, d
+            g = it
+            while g is not None:
+                d = g.data(0)
+                if d and d[0] == 'comp':
+                    return g, d
+                g = g.parentItem()
         return None, None
 
     def select_at(self, p):
@@ -1981,7 +1988,7 @@ class Window(QMainWindow):
         sc = self.view.scene()
         if self.highlight is not None and self.highlight.scene() is sc:
             sc.removeItem(self.highlight)
-        r = group.sceneBoundingRect().adjusted(-30, -30, 30, 30)
+        r = group.mapRectToScene(group.childrenBoundingRect()).adjusted(-30, -30, 30, 30)
         self.highlight = QGraphicsRectItem(r)
         pen = QPen(QColor(COL['select']), 12)
         pen.setStyle(Qt.DashLine)
@@ -2144,8 +2151,8 @@ class Window(QMainWindow):
 
 
 def main():
-    ap = argparse.ArgumentParser(description='Viewer for KiCad schematics: 4/5 (.sch) '
-                                             'and 6 to 9+ (.kicad_sch)')
+    ap = argparse.ArgumentParser(prog='kesev', description='KeSeV, the KiCad Schematic Viewer: '
+                                 'KiCad 4/5 (.sch) and 6 to 9+ (.kicad_sch)')
     ap.add_argument('sch', nargs='?', help='the root schematic (.sch or .kicad_sch)')
     ap.add_argument('-L', '--lib', action='append', default=[],
                     help='an extra symbol library (.lib), repeatable')
@@ -2160,16 +2167,17 @@ def main():
     if a.export:
         os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
     app = QApplication(sys.argv[:1])
+    app.setApplicationName('KeSeV')
     load_fonts()
     project = None
     if a.sch:
         try:
             project = Project(a.sch, a.lib)
         except (OSError, ValueError) as e:
-            sys.exit(f'kicad_sch_viewer: {e}')
+            sys.exit(f'kesev: {e}')
     if a.export:
         if project is None:
-            sys.exit('kicad_sch_viewer: --export needs a schematic')
+            sys.exit('kesev: --export needs a schematic')
         for e in project.errors:
             print('warning:', e, file=sys.stderr)
         nodes = project.nodes if a.sheet == 0 else [project.nodes[a.sheet - 1]]

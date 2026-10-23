@@ -1,4 +1,4 @@
 # local settings (the theme) and Python caches
-kicad_sch_viewer.ini
+kesev.ini
 __pycache__/
 *.pyc
