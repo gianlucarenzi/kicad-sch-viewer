@@ -1,0 +1,4 @@
+# local settings (the theme) and Python caches
+kicad_sch_viewer.ini
+__pycache__/
+*.pyc
