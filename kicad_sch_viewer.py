@@ -10,13 +10,15 @@
 # WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
 # or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
 # (the LICENSE file) for more details.
-"""kicad_sch_viewer.py - a viewer for KiCad 4/5 schematics (legacy .sch).
+"""kicad_sch_viewer.py - a viewer for KiCad schematics, every version.
 
-Opens an "EESchema Schematic File Version 2..4" file, follows its
-hierarchical sheets and draws the symbols from the legacy libraries
-("EESchema-LIBRARY Version 2.x"): the project's *-cache.lib, the
-*-rescue.lib and the libraries listed in the .pro file are found by
-themselves, others are added with -L.
+KiCad 4/5: "EESchema Schematic File Version 2..4" (.sch); the symbols come
+from the legacy libraries ("EESchema-LIBRARY Version 2.x"): the project's
+*-cache.lib, the *-rescue.lib and the libraries listed in the .pro file are
+found by themselves, others are added with -L.
+KiCad 6, 7, 8, 9 and later: the S-expression .kicad_sch, symbols embedded
+in the file; project text variables from the .kicad_pro.
+The hierarchical sheets are followed in both.
 
   kicad_sch_viewer.py board.sch [-L extra.lib ...]
   kicad_sch_viewer.py board.sch --export out.png|out.pdf|out.svg [--sheet N]
@@ -397,14 +399,27 @@ class Schematic:
         self.noconns = []
         self.texts = []                 # (kind, x, y, orient, size, shape, italic, text)
         self.sheets = []
+        # KiCad 6+ only
+        self.v6 = False
+        self.uuid = ''
+        self.libs = None                # the embedded symbols (None: legacy libraries)
+        self.free_texts = []            # (x, y, vertical, size, hj, vj, italic, bold, text)
+        self.textboxes = []
+        self.graphics = []
+        self.images = []                # (x, y, scale, png bytes)
+        self.symbol_instances = {}      # KiCad 6 root: "/sheet.../symbol uuid" -> (ref, unit)
+        self.variables = {}
         self.load(path)
 
     def load(self, path):
         with open(path, encoding='utf-8', errors='replace') as f:
-            lines = f.read().splitlines()
+            text = f.read()
+        if text.lstrip().startswith('(kicad_sch'):
+            schematic_v6(self, sexpr_parse(text))
+            return
+        lines = text.splitlines()
         if not lines or not lines[0].startswith('EESchema Schematic File Version'):
-            raise ValueError(f'{path}: not a KiCad 4/5 schematic '
-                             '(KiCad 6+ .kicad_sch files are not supported)')
+            raise ValueError(f'{path}: not a KiCad schematic (.sch or .kicad_sch)')
         self.version = int(lines[0].split()[-1])
         i = 1
         n = len(lines)
@@ -528,6 +543,497 @@ class Schematic:
 
 
 # =========================================================================
+# KiCad 6 and later (.kicad_sch, S-expressions)
+# =========================================================================
+#
+# Versions 6 (2021), 7 (2023), 8 (20231120), 9 (20250114) and later: the
+# symbols are embedded in the file (lib_symbols), units are millimetres,
+# angles degrees.  Everything is converted into the model of the legacy
+# reader (mils, library y up) so the drawing code is the same.  Unknown
+# items are skipped, so a newer format still shows what it can.
+
+MM = 1000.0 / 25.4                      # millimetres -> mils
+
+PAPER_MM = {
+    'A5': (210, 148), 'A4': (297, 210), 'A3': (420, 297), 'A2': (594, 420),
+    'A1': (841, 594), 'A0': (1189, 841), 'A': (279.4, 215.9), 'B': (431.8, 279.4),
+    'C': (558.8, 431.8), 'D': (863.6, 558.8), 'E': (1117.6, 863.6),
+    'USLetter': (279.4, 215.9), 'USLegal': (355.6, 215.9), 'USLedger': (431.8, 279.4),
+}
+
+LABEL_SHAPES = {'input': 'Input', 'output': 'Output', 'bidirectional': 'BiDi',
+                'tri_state': '3State', 'passive': 'UnSpc'}
+
+_SEXPR_TOKEN = re.compile(r'\(|\)|"(?:[^"\\]|\\.)*"|[^\s()"]+')
+_UNESCAPE = {'n': '\n', 't': '\t', '"': '"', '\\': '\\'}
+
+
+class Q(str):
+    """A quoted string atom (to tell "hide" the text from hide the flag)."""
+
+
+def sexpr_parse(text):
+    stack = [[]]
+    for tok in _SEXPR_TOKEN.findall(text):
+        if tok == '(':
+            stack.append([])
+        elif tok == ')':
+            if len(stack) > 1:
+                done = stack.pop()
+                stack[-1].append(done)
+        elif tok[0] == '"':
+            stack[-1].append(Q(re.sub(r'\\(.)', lambda m: _UNESCAPE.get(m.group(1), m.group(1)),
+                                      tok[1:-1])))
+        else:
+            stack[-1].append(tok)
+    return stack[0][0] if stack[0] else []
+
+
+def sx_all(node, key):
+    return [c for c in node if isinstance(c, list) and c and c[0] == key]
+
+
+def sx(node, key):
+    for c in node:
+        if isinstance(c, list) and c and c[0] == key:
+            return c
+    return None
+
+
+def sx_val(node, key, default=None, index=1):
+    c = sx(node, key)
+    return c[index] if c is not None and len(c) > index else default
+
+
+def sx_num(node, key, default=0.0, index=1):
+    try:
+        return float(sx_val(node, key, default, index))
+    except (TypeError, ValueError):
+        return default
+
+
+def sx_flag(node, key):
+    """A flag written as a bare word (KiCad 6) or (key yes) (KiCad 7+)."""
+    for c in node:
+        if c == key and not isinstance(c, Q):
+            return True
+        if isinstance(c, list) and c and c[0] == key:
+            return len(c) == 1 or c[1] in ('yes', 'true')
+    return False
+
+
+def sx_xy(node, key='at'):
+    c = sx(node, key)
+    if c is None or len(c) < 3:
+        return 0.0, 0.0, 0.0
+    ang = float(c[3]) if len(c) > 3 else 0.0
+    return float(c[1]) * MM, float(c[2]) * MM, ang
+
+
+def sx_effects(node):
+    """-> (size mils, hj, vj, italic, bold, hidden) from (effects ...)."""
+    e = sx(node, 'effects') or []
+    f = sx(e, 'font') or []
+    size = sx_num(f, 'size', 1.27) * MM
+    j = sx(e, 'justify') or []
+    hj = 'L' if 'left' in j else 'R' if 'right' in j else 'C'
+    vj = 'T' if 'top' in j else 'B' if 'bottom' in j else 'C'
+    return size, hj, vj, sx_flag(f, 'italic'), sx_flag(f, 'bold'), sx_flag(e, 'hide')
+
+
+def sx_stroke(node):
+    s = sx(node, 'stroke') or []
+    w = sx_num(s, 'width', 0.0) * MM
+    t = sx_val(s, 'type', 'default')
+    return w, t
+
+
+def stroke_color(node):
+    """(stroke (color r g b a)) -> '#rrggbb', or None for the default."""
+    c = sx(sx(node, 'stroke') or [], 'color')
+    if c is None or len(c) < 5:
+        return None
+    r, g, b, a = (float(v) for v in c[1:5])
+    if a == 0 and r == 0 and g == 0 and b == 0:
+        return None
+    return '#%02X%02X%02X' % (int(r), int(g), int(b))
+
+
+def fill_color(node):
+    """(fill (color r g b a)) -> QColor-able '#rrggbb' or None."""
+    c = sx(sx(node, 'fill') or [], 'color')
+    if c is None or len(c) < 5:
+        return None
+    r, g, b, a = (float(v) for v in c[1:5])
+    if a == 0:
+        return None
+    return '#%02X%02X%02X' % (int(r), int(g), int(b))
+
+
+def sx_fill(node):
+    """KiCad fill -> the legacy letters: F outline (foreground), f background,
+    N none, or '#rrggbb' for a colour fill."""
+    f = sx(node, 'fill') or []
+    t = sx_val(f, 'type', 'none')
+    if t == 'outline':
+        return 'F'
+    if t == 'background':
+        return 'f'
+    if t == 'color':
+        c = sx(f, 'color')
+        if c and len(c) >= 4:
+            return '#%02X%02X%02X' % tuple(int(float(v)) for v in c[1:4])
+    return 'N'
+
+
+def kicad_markup(s, variables=None):
+    """KiCad 6+ text markup: ~{x} overbar (combining overline), _{x} and ^{x}
+    plain, ${VAR} from the title block when known."""
+    if not s:
+        return s
+
+    def overbar(m):
+        return ''.join(ch + '̅' for ch in m.group(1))
+    s = re.sub(r'~\{([^}]*)\}', overbar, s)
+    s = re.sub(r'[_^]\{([^}]*)\}', r'\1', s)
+    if variables:
+        s = re.sub(r'\$\{([^}]+)\}',
+                   lambda m: variables.get(m.group(1), variables.get(m.group(1).upper(), m.group(0))), s)
+    return s
+
+
+def lib_symbol_v6(node):
+    """A (symbol "Lib:Name" ...) of lib_symbols -> LibSymbol (lib coords, mils)."""
+    sym = LibSymbol(node[1])
+    pn = sx(node, 'pin_names')
+    sym.text_offset = sx_num(pn, 'offset', 0.508) * MM if pn is not None else 0.508 * MM
+    sym.show_pin_name = not (pn is not None and sx_flag(pn, 'hide'))
+    pnum = sx(node, 'pin_numbers')
+    sym.show_pin_num = not (pnum is not None and sx_flag(pnum, 'hide'))
+    sym.power = sx(node, 'power') is not None
+    units = 1
+    for sub in sx_all(node, 'symbol'):
+        m = re.search(r'_(\d+)_(\d+)$', sub[1])
+        unit, conv = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+        units = max(units, unit)
+        for it in sub[2:]:
+            if isinstance(it, list) and it:
+                try:
+                    lib_item_v6(sym, it, unit, conv)
+                except (TypeError, ValueError, IndexError):
+                    pass
+    sym.unit_count = units
+    return sym
+
+
+def lib_item_v6(sym, it, unit, conv):
+    k = it[0]
+    w, _ = sx_stroke(it)
+    fill = sx_fill(it)
+
+    def pt(c):                          # (xy x y) -> mils, library y up
+        return float(c[1]) * MM, float(c[2]) * MM
+    if k == 'polyline':
+        pts = [pt(c) for c in sx_all(sx(it, 'pts') or [], 'xy')]
+        if len(pts) >= 2:
+            sym.draw.append(('P', unit, conv, (pts, w, fill)))
+    elif k == 'bezier':
+        pts = [pt(c) for c in sx_all(sx(it, 'pts') or [], 'xy')]
+        if len(pts) == 4:
+            sym.draw.append(('B', unit, conv, (pts, w, fill)))
+    elif k == 'rectangle':
+        x1, y1 = pt(sx(it, 'start'))
+        x2, y2 = pt(sx(it, 'end'))
+        sym.draw.append(('S', unit, conv, (x1, y1, x2, y2, w, fill)))
+    elif k == 'circle':
+        cx, cy = pt(sx(it, 'center'))
+        sym.draw.append(('C', unit, conv, (cx, cy, sx_num(it, 'radius') * MM, w, fill)))
+    elif k == 'arc':
+        s = pt(sx(it, 'start'))
+        e = pt(sx(it, 'end'))
+        mid = sx(it, 'mid')
+        if mid is not None:
+            sym.draw.append(('A3', unit, conv, (s, pt(mid), e, w, fill)))
+        else:                           # early 6.0: (radius (at) (length) (angles))
+            r = sx(it, 'radius') or []
+            c = sx(r, 'at')
+            if c is not None:
+                cx, cy = pt(c)
+                rad = sx_num(r, 'length') * MM
+                sym.draw.append(('A', unit, conv, (cx, cy, rad, s, e, w, fill)))
+    elif k == 'text':
+        x, y, ang = sx_xy(it)
+        size, hj, vj, italic, bold, hidden = sx_effects(it)
+        vert = ang in (90, 270, 900, 2700)
+        sym.draw.append(('T', unit, conv, (900 if vert else 0, x, y, size, hidden,
+                                           kicad_markup(it[1]), hj, vj)))
+    elif k == 'pin':
+        x, y, ang = sx_xy(it)
+        orient = {0: 'R', 90: 'U', 180: 'L', 270: 'D'}.get(int(ang) % 360, 'R')
+        length = sx_num(it, 'length', 2.54) * MM
+        nm = sx(it, 'name') or ['name', '']
+        nu = sx(it, 'number') or ['number', '']
+        sname = sx_effects(nm)[0]
+        snum = sx_effects(nu)[0]
+        gshape = it[2] if len(it) > 2 and isinstance(it[2], str) else 'line'
+        shape = {'inverted': 'I', 'clock': 'C', 'inverted_clock': 'IC',
+                 'input_low': 'L', 'clock_low': 'CL', 'output_low': 'V',
+                 'edge_clock_high': 'F'}.get(gshape, '')
+        if sx_flag(it, 'hide'):
+            shape = 'N' + shape
+        name = nm[1] if len(nm) > 1 else ''
+        num = nu[1] if len(nu) > 1 else ''
+        sym.draw.append(('X', unit, conv, (kicad_markup(name) if name != '~' else '~', num,
+                                           x, y, length, orient, snum, sname,
+                                           it[1] if len(it) > 1 else '', shape)))
+
+
+def symbol_matrix(angle, mirror):
+    """The KiCad orientation -> (a, b, c, d) applied to library coordinates
+    (y up): sheet = pos + (a x + b y, c x + d y).  Rotation counter-clockwise
+    on the sheet, then the mirror (x: about the X axis, y: about the Y axis)."""
+    r = math.radians(angle)
+    co, si = round(math.cos(r)), round(math.sin(r))
+    # sheet frame (y down): rotate counter-clockwise
+    m00, m01, m10, m11 = co, si, -si, co
+    if mirror == 'x':
+        m10, m11 = -m10, -m11
+    elif mirror == 'y':
+        m00, m01 = -m00, -m01
+    # library y up -> sheet y down
+    return (m00, -m01, m10, -m11)
+
+
+def schematic_v6(sch, root):
+    """Fill a Schematic from the (kicad_sch ...) tree."""
+    sch.version = int(sx_val(root, 'version', 0) or 0)
+    sch.v6 = True
+    sch.uuid = sx_val(root, 'uuid', '')
+    sch.libs = {}
+    paper = sx(root, 'paper')
+    if paper is not None and len(paper) > 1:
+        name = paper[1]
+        if name == 'User' and len(paper) >= 4:
+            w, h = float(paper[2]), float(paper[3])
+        else:
+            w, h = PAPER_MM.get(name, PAPER_MM['A4'])
+        if 'portrait' in paper[2:]:
+            w, h = min(w, h), max(w, h)
+        sch.page = (w * MM, h * MM)
+        sch.page_name = name
+    tb = sx(root, 'title_block') or []
+    for key, name in (('title', 'Title'), ('date', 'Date'), ('rev', 'Rev'),
+                      ('company', 'Comp')):
+        v = sx_val(tb, key)
+        if v:
+            sch.title[name] = v
+    for c in sx_all(tb, 'comment'):
+        if len(c) > 2:
+            sch.title[f'Comment{c[1]}'] = c[2]
+    variables = {'TITLE': sch.title.get('Title', ''), 'DATE': sch.title.get('Date', ''),
+                 'REVISION': sch.title.get('Rev', ''), 'COMPANY': sch.title.get('Comp', ''),
+                 'FILENAME': os.path.basename(sch.path)}
+    for k in range(1, 10):
+        variables[f'COMMENT{k}'] = sch.title.get(f'Comment{k}', '')
+    variables.update(project_variables(os.path.dirname(os.path.abspath(sch.path))))
+    for k in list(sch.title):           # the title block may use them too
+        sch.title[k] = kicad_markup(sch.title[k], variables)
+    sch.variables = variables
+    ls = sx(root, 'lib_symbols') or []
+    for node in sx_all(ls, 'symbol'):
+        try:
+            sch.libs[node[1]] = lib_symbol_v6(node)
+        except (TypeError, ValueError, IndexError):
+            pass
+    for it in root[1:]:
+        if not isinstance(it, list) or not it:
+            continue
+        k = it[0]
+        try:
+            if k in ('wire', 'bus'):
+                pts = [(float(c[1]) * MM, float(c[2]) * MM) for c in sx_all(sx(it, 'pts') or [], 'xy')]
+                for p0, p1 in zip(pts, pts[1:]):
+                    sch.wires.append((k, p0[0], p0[1], p1[0], p1[1]))
+            elif k == 'bus_entry':
+                x, y, _ = sx_xy(it)
+                sz = sx(it, 'size') or ['size', 0, 0]
+                sch.wires.append(('wire', x, y, x + float(sz[1]) * MM, y + float(sz[2]) * MM))
+            elif k == 'junction':
+                x, y, _ = sx_xy(it)
+                sch.junctions.append((x, y))
+            elif k == 'no_connect':
+                x, y, _ = sx_xy(it)
+                sch.noconns.append((x, y))
+            elif k in ('label', 'global_label', 'hierarchical_label'):
+                x, y, ang = sx_xy(it)
+                size, hj, vj, italic, bold, hidden = sx_effects(it)
+                kind = {'label': 'Label', 'global_label': 'GLabel',
+                        'hierarchical_label': 'HLabel'}[k]
+                spin = int(ang) % 360
+                if kind == 'Label':     # 0 right, 1 up, 2 left, 3 down
+                    orient = {0: 0, 90: 1, 180: 2, 270: 3}.get(spin, 0)
+                else:                   # 0 left, 1 up, 2 right, 3 down
+                    orient = {0: 2, 90: 1, 180: 0, 270: 3}.get(spin, 2)
+                shape = LABEL_SHAPES.get(sx_val(it, 'shape', ''), 'UnSpc')
+                sch.texts.append((kind, x, y, orient, size, shape, italic,
+                                  kicad_markup(it[1], variables)))
+            elif k == 'text':
+                x, y, ang = sx_xy(it)
+                size, hj, vj, italic, bold, hidden = sx_effects(it)
+                if not hidden:
+                    font = sx(sx(it, 'effects') or [], 'font') or []
+                    sch.free_texts.append((x, y, int(ang) % 180 == 90, size, hj, vj, italic, bold,
+                                           kicad_markup(it[1], variables),
+                                           fill_color(['x', ['fill', sx(font, 'color') or []]])))
+            elif k == 'text_box':
+                x, y, _ = sx_xy(it)
+                sz = sx(it, 'size')
+                if sz is not None:
+                    w, h = float(sz[1]) * MM, float(sz[2]) * MM
+                else:
+                    x, y = (float(v) * MM for v in sx(it, 'start')[1:3])
+                    ex, ey = (float(v) * MM for v in sx(it, 'end')[1:3])
+                    w, h = ex - x, ey - y
+                size, hj, vj, italic, bold, hidden = sx_effects(it)
+                sw, st = sx_stroke(it)
+                mg = sx(it, 'margins')
+                margin = float(mg[1]) * MM if mg is not None and len(mg) > 1 else size * 0.6
+                sch.textboxes.append((x, y, w, h, kicad_markup(it[1], variables), size, hj, vj,
+                                      italic, bold, st != 'none' and sw >= 0, margin, sx_fill(it)))
+            elif k in ('polyline', 'rectangle', 'circle', 'arc', 'bezier'):
+                sch.graphics.append(graphic_v6(it))
+            elif k == 'image':
+                x, y, _ = sx_xy(it)
+                data = sx(it, 'data')
+                if data is not None:
+                    import base64
+                    raw = ''.join(str(d) for d in data[1:])
+                    sch.images.append((x, y, sx_num(it, 'scale', 1.0), base64.b64decode(raw)))
+            elif k == 'symbol':
+                sch.components.append(symbol_v6(it, variables))
+            elif k == 'sheet':
+                sch.sheets.append(sheet_v6(it, variables))
+            elif k == 'symbol_instances':  # KiCad 6: references in the root file
+                for p in sx_all(it, 'path'):
+                    sch.symbol_instances[p[1]] = (sx_val(p, 'reference', '?'),
+                                                  int(sx_num(p, 'unit', 1)))
+        except (TypeError, ValueError, IndexError, AttributeError):
+            pass                        # an item we cannot read: skip it
+
+
+_PRO_VARS = {}
+
+
+def project_variables(folder):
+    """The text_variables of the .kicad_pro in a folder (cached)."""
+    if folder not in _PRO_VARS:
+        found = {}
+        try:
+            import json
+            for f in sorted(os.listdir(folder)):
+                if f.endswith('.kicad_pro'):
+                    with open(os.path.join(folder, f), encoding='utf-8') as fh:
+                        tv = json.load(fh).get('text_variables') or {}
+                    found = {str(k): str(v) for k, v in tv.items()}
+                    break
+        except (OSError, ValueError):
+            pass
+        _PRO_VARS[folder] = found
+    return _PRO_VARS[folder]
+
+
+def graphic_v6(it):
+    k = it[0]
+    w, st = sx_stroke(it)
+
+    def pt(c):
+        return float(c[1]) * MM, float(c[2]) * MM
+    data = {'kind': k, 'width': w, 'style': st, 'fill': sx_fill(it),
+            'color': stroke_color(it)}
+    if k in ('polyline', 'bezier'):
+        data['pts'] = [pt(c) for c in sx_all(sx(it, 'pts') or [], 'xy')]
+    elif k == 'rectangle':
+        data['start'], data['end'] = pt(sx(it, 'start')), pt(sx(it, 'end'))
+    elif k == 'circle':
+        data['center'] = pt(sx(it, 'center'))
+        data['radius'] = sx_num(it, 'radius') * MM
+    elif k == 'arc':
+        data['start'], data['mid'], data['end'] = (pt(sx(it, 'start')), pt(sx(it, 'mid')),
+                                                   pt(sx(it, 'end')))
+    return data
+
+
+def symbol_v6(it, variables):
+    c = Component()
+    c.v6 = True
+    c.lib = sx_val(it, 'lib_name') or sx_val(it, 'lib_id', '')
+    c.x, c.y, ang = sx_xy(it)
+    mirror = sx_val(it, 'mirror', '')
+    c.m = symbol_matrix(ang, mirror)
+    c.unit = int(sx_num(it, 'unit', 1))
+    c.convert = int(sx_num(it, 'body_style', sx_num(it, 'convert', 1)))
+    c.stamp = sx_val(it, 'uuid', '')
+    c.dnp = sx_flag(it, 'dnp')
+    names = {'Reference': 0, 'Value': 1, 'Footprint': 2, 'Datasheet': 3}
+    extra = 4
+    for p in sx_all(it, 'property'):
+        if len(p) < 3:
+            continue
+        name, text = p[1], p[2]
+        n = names.get(name)
+        if n is None:
+            n = extra
+            extra += 1
+        x, y, fang = sx_xy(p)
+        size, hj, vj, italic, bold, hidden = sx_effects(p)
+        hidden = hidden or sx_flag(p, 'hide')
+        f = Field(n, kicad_markup(text, variables), 'V' if int(fang) % 180 == 90 else 'H',
+                  x, y, size, not hidden, hj, vj, name if n >= 4 else '')
+        c.fields.append(f)
+        if n == 0:
+            c.ref = text
+    own = {('Reference', 'Value', 'Footprint', 'Datasheet')[f.n] if f.n < 4 else f.name: f.text
+           for f in c.fields}
+    own.update({k.upper(): v for k, v in own.items()})
+    own = dict(variables, **own)
+    for f in c.fields:
+        if '${' in f.text:
+            f.text = kicad_markup(f.text, own)
+    # KiCad 7+: the references of every instance, by sheet path
+    c.ar_raw = []
+    for proj in sx_all(sx(it, 'instances') or [], 'project'):
+        for p in sx_all(proj, 'path'):
+            c.ar_raw.append((p[1], sx_val(p, 'reference', c.ref), int(sx_num(p, 'unit', c.unit))))
+    return c
+
+
+def sheet_v6(it, variables):
+    sh = Sheet()
+    sh.x, sh.y, _ = sx_xy(it)
+    sz = sx(it, 'size') or ['size', 0, 0]
+    sh.w, sh.h = float(sz[1]) * MM, float(sz[2]) * MM
+    sh.stamp = sx_val(it, 'uuid', '')
+    sh.fill = fill_color(it)
+    sh.border = sx_stroke(it)[0] or 10
+    for p in sx_all(it, 'property'):
+        if len(p) < 3:
+            continue
+        size = sx_effects(p)[0]
+        if p[1] in ('Sheetname', 'Sheet name'):
+            sh.name, sh.name_size = p[2], size
+        elif p[1] in ('Sheetfile', 'Sheet file'):
+            sh.file, sh.file_size = p[2], size
+    for p in sx_all(it, 'pin'):
+        x, y, ang = sx_xy(p)
+        side = {180: 'L', 0: 'R', 90: 'T', 270: 'B'}.get(int(ang) % 360, 'L')
+        shape = {'input': 'I', 'output': 'O', 'bidirectional': 'B', 'tri_state': 'T'}.get(
+            p[2] if len(p) > 2 else '', 'U')
+        shape = {'I': 'Input', 'O': 'Output', 'B': 'BiDi', 'T': '3State'}.get(shape, 'UnSpc')
+        sh.pins.append((kicad_markup(p[1], variables), shape, side, x, y, sx_effects(p)[0]))
+    return sh
+
+
+# =========================================================================
 # Drawing
 # =========================================================================
 
@@ -542,7 +1048,7 @@ class Painter:
 
     # -- primitives -------------------------------------------------------
     def pen(self, colour, width=6, style=Qt.SolidLine):
-        p = QPen(QColor(COL[colour]), max(width, 4))
+        p = QPen(QColor(COL.get(colour, colour)), max(width, 4))
         p.setCapStyle(Qt.RoundCap)
         p.setJoinStyle(Qt.RoundJoin)
         p.setStyle(style)
@@ -564,7 +1070,7 @@ class Painter:
         it = QGraphicsPathItem(path, parent)
         it.setPen(self.pen(colour, width, style))
         if fill:
-            it.setBrush(QBrush(QColor(COL[fill])))
+            it.setBrush(QBrush(QColor(COL.get(fill, fill))))
         if parent is None:
             self.scene.addItem(it)
         return it
@@ -577,7 +1083,7 @@ class Painter:
             return None
         it = QGraphicsSimpleTextItem(s, parent)
         it.setFont(self.font(size, italic, bold))
-        it.setBrush(QBrush(QColor(COL[colour])))
+        it.setBrush(QBrush(QColor(COL.get(colour, colour))))
         br = it.boundingRect()
         # the box of the glyphs: use the cap height band around the text
         fm = QFontMetricsF(it.font())
@@ -620,10 +1126,99 @@ class Painter:
             self.path_item(p, 'noconnect', 6)
         for t in sch.texts:
             self.draw_text_item(*t)
+        for x, y, vert, size, hj, vj, italic, bold, text, colour in sch.free_texts:
+            self.text(x, y, text, size, colour or 'notes', vert, hj, vj, italic, bold)
+        for tb in sch.textboxes:
+            self.draw_textbox(*tb)
+        for g in sch.graphics:
+            self.draw_graphic(g)
+        for img in sch.images:
+            self.draw_image(*img)
         for sh in sch.sheets:
             self.draw_sheet(sh)
         for c in sch.components:
             self.draw_component(c)
+
+    # -- KiCad 6+ sheet items -------------------------------------------------
+    @staticmethod
+    def stroke_style(style):
+        return {'dash': Qt.DashLine, 'dot': Qt.DotLine, 'dash_dot': Qt.DashDotLine,
+                'dash_dot_dot': Qt.DashDotDotLine}.get(style, Qt.SolidLine)
+
+    def draw_graphic(self, g):
+        k = g['kind']
+        style = self.stroke_style(g['style'])
+        p = QPainterPath()
+        if k == 'polyline' and len(g['pts']) >= 2:
+            p = self._poly(g['pts'], close=False)
+        elif k == 'bezier' and len(g['pts']) == 4:
+            a, b, c, d = g['pts']
+            p.moveTo(*a)
+            p.cubicTo(QPointF(*b), QPointF(*c), QPointF(*d))
+        elif k == 'rectangle':
+            (x1, y1), (x2, y2) = g['start'], g['end']
+            p.addRect(QRectF(QPointF(x1, y1), QPointF(x2, y2)).normalized())
+        elif k == 'circle':
+            p.addEllipse(QPointF(*g['center']), g['radius'], g['radius'])
+        elif k == 'arc':
+            p = self.arc3(g['start'], g['mid'], g['end'])
+        else:
+            return
+        fill = g['fill']
+        fill = None if fill == 'N' else {'F': 'notes', 'f': 'body_fill'}.get(fill, fill)
+        colour = g.get('color') or 'notes'
+        self.path_item(p, colour, g['width'] or 6, fill=fill, style=style)
+
+    def draw_textbox(self, x, y, w, h, text, size, hj, vj, italic, bold, border, margin, fill):
+        p = QPainterPath()
+        p.addRect(QRectF(x, y, w, h))
+        if border or fill not in ('N', None):
+            f = None if fill == 'N' else {'F': 'notes', 'f': 'body_fill'}.get(fill, fill)
+            it = self.path_item(p, 'notes', 6, fill=f)
+            if not border:
+                it.setPen(QPen(Qt.NoPen))
+        tx = {'L': x + margin, 'C': x + w / 2, 'R': x + w - margin}[hj]
+        ty = {'T': y + margin, 'C': y + h / 2, 'B': y + h - margin}[vj]
+        self.text(tx, ty, text, size, 'notes', False, hj, vj, italic, bold)
+
+    def draw_image(self, x, y, scale, data):
+        from PyQt5.QtGui import QPixmap
+        from PyQt5.QtWidgets import QGraphicsPixmapItem
+        pm = QPixmap()
+        if not pm.loadFromData(data):
+            return
+        img = pm.toImage()
+        ppi = img.dotsPerMeterX() * 0.0254 if img.dotsPerMeterX() > 0 else 300.0
+        k = 1000.0 / ppi * scale        # pixels -> mils
+        it = QGraphicsPixmapItem(pm)
+        it.setTransformationMode(Qt.SmoothTransformation)
+        it.setTransform(QTransform().translate(x - pm.width() * k / 2,
+                                               y - pm.height() * k / 2).scale(k, k))
+        self.scene.addItem(it)
+
+    @staticmethod
+    def arc3(s, m, e):
+        """The arc through start, mid and end (sheet coordinates)."""
+        (x1, y1), (x2, y2), (x3, y3) = s, m, e
+        d = 2 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2))
+        p = QPainterPath(QPointF(x1, y1))
+        if abs(d) < 1e-9:               # collinear: a straight line
+            p.lineTo(x3, y3)
+            return p
+        ux = ((x1 * x1 + y1 * y1) * (y2 - y3) + (x2 * x2 + y2 * y2) * (y3 - y1)
+              + (x3 * x3 + y3 * y3) * (y1 - y2)) / d
+        uy = ((x1 * x1 + y1 * y1) * (x3 - x2) + (x2 * x2 + y2 * y2) * (x1 - x3)
+              + (x3 * x3 + y3 * y3) * (x2 - x1)) / d
+        r = math.hypot(x1 - ux, y1 - uy)
+
+        def ang(x, y):                  # Qt angles: counter-clockwise, y up
+            return math.degrees(math.atan2(-(y - uy), x - ux)) % 360
+        a1, am, a3 = ang(x1, y1), ang(x2, y2), ang(x3, y3)
+        sweep = (a3 - a1) % 360
+        if (am - a1) % 360 > sweep:     # the mid point is the other way round
+            sweep -= 360
+        p.arcTo(QRectF(ux - r, uy - r, 2 * r, 2 * r), a1, sweep)
+        return p
 
     def draw_frame(self, sch, sheet_label):
         w, h = sch.page
@@ -747,9 +1342,11 @@ class Painter:
     def draw_sheet(self, sh):
         p = QPainterPath()
         p.addRect(QRectF(sh.x, sh.y, sh.w, sh.h))
-        it = self.path_item(p, 'sheet', 10)
+        it = self.path_item(p, 'sheet', getattr(sh, 'border', 10))
         it.setData(0, ('sheet', sh))
-        it.setBrush(QBrush(QColor(255, 255, 255, 1)))  # clickable inside
+        fill = getattr(sh, 'fill', None)
+        it.setBrush(QBrush(QColor(fill) if fill else QColor(255, 255, 255, 1)))  # clickable inside
+        it.setZValue(-2)                # under the texts drawn on the sheet
         it.setToolTip(f'{sh.name}\n{sh.file}\n(double-click to open)')
         self.text(sh.x, sh.y - 20, 'Sheet: ' + sh.name, sh.name_size, 'sheet_name', hj='L', vj='B')
         self.text(sh.x, sh.y + sh.h + 20, 'File: ' + sh.file, sh.file_size, 'sheet_file', hj='L', vj='T')
@@ -796,7 +1393,17 @@ class Painter:
                 if sym is not None and sym.unit_count > 1:
                     text += chr(ord('A') + unit - 1)
             colour = {0: 'ref', 1: 'value'}.get(f.n, 'field')
-            self.draw_field(c, f, text, colour, rotated, group)
+            if getattr(c, 'v6', False):
+                self.draw_field_v6(c, f, text, colour, group)
+            else:
+                self.draw_field(c, f, text, colour, rotated, group)
+        if getattr(c, 'dnp', False) and sym is not None:   # "do not populate": a red cross
+            r = group.childrenBoundingRect()
+            p = QPainterPath(r.topLeft())
+            p.lineTo(r.bottomRight())
+            p.moveTo(r.topRight())
+            p.lineTo(r.bottomLeft())
+            self.path_item(p, 'missing', 10, parent=group)
         info = [f'{ref}  ({c.lib})']
         for f in c.fields:
             if f.n in (1, 2, 3) and f.text:
@@ -829,6 +1436,25 @@ class Painter:
         ox, oy = a * rx + b * ry, cc * rx + d * ry
         disp_vert = vert != rotated
         self.text(c.x + ox, c.y + oy, text, f.size, colour, disp_vert, 'C', 'C', parent=group)
+
+    def draw_field_v6(self, c, f, text, colour, group):
+        """KiCad 6+: the position in the file is where the field is on the
+        sheet; its angle and justification are in the symbol frame.  The text
+        is drawn centred in its box turned by the symbol (always readable)."""
+        a, b, cc, d = c.m
+        md = (a, -b, cc, -d)            # the symbol transform in the sheet frame (y down)
+        fm = QFontMetricsF(self.font(f.size))
+        w = fm.horizontalAdvance(text) if hasattr(fm, 'horizontalAdvance') else fm.width(text)
+        h = f.size
+        x0 = {'L': 0, 'C': -w / 2, 'R': -w}.get(f.hj, -w / 2)
+        y0 = {'T': 0, 'C': -h / 2, 'B': -h}.get(f.vj, -h / 2)
+        cx, cy = x0 + w / 2, y0 + h / 2
+        vert = f.orient == 'V'
+        if vert:                        # 90 degrees counter-clockwise (y down)
+            cx, cy = cy, -cx
+        ox, oy = md[0] * cx + md[1] * cy, md[2] * cx + md[3] * cy
+        disp_vert = vert != (a == 0)
+        self.text(f.x + ox, f.y + oy, text, f.size, colour, disp_vert, 'C', 'C', parent=group)
 
     def draw_symbol(self, sym, c, unit, T, group):
         conv = c.convert
@@ -863,6 +1489,20 @@ class Painter:
                 if fill != 'N':
                     p.closeSubpath()
                 self.shape(p, thick, fill, group)
+            elif kind == 'A3':
+                s, m, e, thick, fill = data
+                p = self.arc3(T(*s), T(*m), T(*e))
+                if fill != 'N':
+                    p.closeSubpath()
+                self.shape(p, thick, fill, group)
+            elif kind == 'B':
+                pts, thick, fill = data
+                q = [T(*v) for v in pts]
+                p = QPainterPath(QPointF(*q[0]))
+                p.cubicTo(QPointF(*q[1]), QPointF(*q[2]), QPointF(*q[3]))
+                if fill != 'N':
+                    p.closeSubpath()
+                self.shape(p, thick, fill, group)
             elif kind == 'T':
                 angle, x, y, size, hidden, text, hj, vj = data
                 if hidden:
@@ -875,7 +1515,8 @@ class Painter:
 
     def shape(self, path, thick, fill, group):
         it = self.path_item(path, 'body', thick or 6,
-                            fill={'F': 'body', 'f': 'body_fill'}.get(fill),
+                            fill=None if fill in ('N', None) else
+                            {'F': 'body', 'f': 'body_fill'}.get(fill, fill),
                             parent=group)
         if fill == 'f':
             it.setZValue(-1)
@@ -963,12 +1604,33 @@ class Project:
         self.lib_files = []
         for p in extra_libs:
             self.add_lib(p)
-        self.find_libs()
-        self.root = SheetNode(self.load(self.root_path), '/', '')
+        root = self.load(self.root_path)
+        if root is None:
+            raise ValueError(self.errors[-1] if self.errors else f'{root_path}: cannot read')
+        if not root.v6:                 # KiCad 6+ files carry their symbols
+            self.find_libs()
+        self.root = SheetNode(root, '/', '')
         self.nodes = [self.root]
         self.build(self.root, set())
         for k, n in enumerate(self.nodes, 1):
             n.number = k
+        if root.v6:
+            self.instances_v6(root)
+
+    def instances_v6(self, root):
+        """The reference of each symbol in each sheet instance, keyed like
+        the legacy AR paths: "/sheet uuid/.../symbol uuid"."""
+        prefix = '/' + root.uuid
+        for sch in self.files.values():
+            if sch is None or not sch.v6:
+                continue
+            for c in sch.components:
+                for path, ref, unit in getattr(c, 'ar_raw', ()):
+                    if root.uuid and path.startswith(prefix):     # KiCad 7+
+                        c.ar[path[len(prefix):] + '/' + c.stamp] = (ref, unit)
+                for path, ru in root.symbol_instances.items():   # KiCad 6
+                    if path.endswith('/' + c.stamp):
+                        c.ar[path] = ru
 
     def add_lib(self, path):
         if os.path.isfile(path) and path not in self.lib_files:
@@ -1026,7 +1688,8 @@ def render_sheet(project, node):
     scene.setBackgroundBrush(QBrush(QColor(CANVAS)))
     if node.sch is not None:
         label = f'{node.name}  ({node.number}/{len(project.nodes)})'
-        Painter(scene, project.libs, node.path).draw(node.sch, label)
+        libs = node.sch.libs if node.sch.libs is not None else project.libs
+        Painter(scene, libs, node.path).draw(node.sch, label)
         w, h = node.sch.page
         scene.setSceneRect(QRectF(-200, -200, w + 400, h + 400))
     return scene
@@ -1240,10 +1903,10 @@ class Window(QMainWindow):
         for sch in self.project.files.values():
             if sch is None:
                 continue
+            libs = sch.libs if sch.libs is not None else self.project.libs
             for c in sch.components:
                 n = c.lib
-                if not (n in self.project.libs or n.replace(':', '_') in self.project.libs
-                        or n.split(':')[-1] in self.project.libs):
+                if not (n in libs or n.replace(':', '_') in libs or n.split(':')[-1] in libs):
                     miss.add(n)
         return miss
 
@@ -1457,7 +2120,7 @@ class Window(QMainWindow):
     # -- files ----------------------------------------------------------------
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(self, 'Open schematic', '',
-                                              'KiCad 4/5 schematic (*.sch)')
+                                              'KiCad schematic (*.kicad_sch *.sch)')
         if path:
             try:
                 self.set_project(Project(path))
@@ -1481,8 +2144,9 @@ class Window(QMainWindow):
 
 
 def main():
-    ap = argparse.ArgumentParser(description='Viewer for KiCad 4/5 schematics (.sch)')
-    ap.add_argument('sch', nargs='?', help='the root schematic (.sch)')
+    ap = argparse.ArgumentParser(description='Viewer for KiCad schematics: 4/5 (.sch) '
+                                             'and 6 to 9+ (.kicad_sch)')
+    ap.add_argument('sch', nargs='?', help='the root schematic (.sch or .kicad_sch)')
     ap.add_argument('-L', '--lib', action='append', default=[],
                     help='an extra symbol library (.lib), repeatable')
     ap.add_argument('--export', metavar='OUT',

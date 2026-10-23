@@ -1,8 +1,12 @@
 # kicad-sch-viewer
 
-A viewer for KiCad 4/5 schematics (legacy `.sch`, "EESchema Schematic File
-Version 2..4") with the hierarchical sheets and the symbols of the legacy
-libraries (`.lib`). KiCad 6+ `.kicad_sch` files are not supported.
+A viewer for KiCad schematics of every version, with their hierarchical
+sheets:
+
+- KiCad 4/5: legacy `.sch` ("EESchema Schematic File Version 2..4"), the
+  symbols from the legacy libraries (`.lib`);
+- KiCad 6, 7, 8, 9 and later: `.kicad_sch` (S-expressions), the symbols
+  embedded in the file, the project's text variables from the `.kicad_pro`.
 
 ## Contents
 
@@ -59,15 +63,17 @@ Qt 5.15).
 ## Use
 
 ```sh
-./kicad_sch_viewer.py board.sch [-L extra.lib ...] [--theme light|dark|system]
+./kicad_sch_viewer.py board.kicad_sch [--theme light|dark|system]
+./kicad_sch_viewer.py board.sch [-L extra.lib ...]          # KiCad 4/5
 ./kicad_sch_viewer.py board.sch --export out.png              # sheet 1
 ./kicad_sch_viewer.py board.sch --export out.pdf --sheet 3
 ./kicad_sch_viewer.py board.sch --export out.png --sheet 0    # all: out-1.png, out-2.png, ...
 ```
 
-The symbol libraries are found by themselves: the project's `*-cache.lib`,
-`*-rescue.lib` and the `LibName` entries of the `.pro` file; `-L` adds
-others.
+KiCad 4/5: the symbol libraries are found by themselves: the project's
+`*-cache.lib`, `*-rescue.lib` and the `LibName` entries of the `.pro` file;
+`-L` adds others. KiCad 6+ files need nothing else: the symbols are in the
+file.
 
 - Mouse: wheel = zoom, drag = pan, click = a symbol's fields in the panel,
   double-click on a sheet = open it.
@@ -81,11 +87,30 @@ others.
 - Theme menu: Material light, Material dark (a style sheet over Qt's Fusion
   style, no extra packages) or the system look.
 
+## What is drawn
+
+Symbols (units, body styles, rotation, mirror, pins with their shapes,
+names and numbers, "do not populate" cross), fields with KiCad's placement,
+wires, buses, bus entries, junctions, no-connects, local / global /
+hierarchical labels, texts with their colours, text boxes, graphic lines,
+rectangles, circles, arcs and Bézier curves, sheet fill colours, embedded
+images (KiCad 6+), the title block. KiCad 6+ text markup: `~{...}` overbar,
+`_{...}` / `^{...}`, `${VAR}` from the title block, the `.kicad_pro` text
+variables and the symbol's own fields.
+
+Tested on KiCad 5 files (format 4) and KiCad 9 files (format 20250114); the
+KiCad 6, 7 and 8 differences (sheet properties, `symbol_instances`, bare
+`hide` flags, `convert` / `body_style`) are handled from the format
+description, and unknown items of newer formats are skipped.
+
 ## Known approximations
 
-The texts use DejaVu Sans instead of KiCad's stroke font; global label
-outlines are simplified; Bézier curves are drawn as their control polygon;
-embedded bitmaps (`$Bitmap`) are skipped.
+The texts use DejaVu Sans instead of KiCad's stroke font or the TrueType
+fonts chosen in KiCad 7+; global label outlines are simplified; the title
+block is a fixed layout (custom `.kicad_wks` drawing sheets are not read);
+KiCad 4/5 Bézier curves are drawn as their control polygon and embedded
+bitmaps (`$Bitmap`) are skipped; KiCad 8+ tables, rule areas and net class
+flags are skipped.
 
 ## Licences
 
