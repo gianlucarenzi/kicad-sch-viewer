@@ -89,6 +89,7 @@ embedded bitmaps (`$Bitmap`) are skipped.
 
 ## Licences
 
-The fonts keep their own licences: DejaVu (Bitstream Vera licence,
+The program is free software under the GNU General Public License version 3
+or later (`LICENSE`). The fonts keep their own licences: DejaVu (Bitstream Vera licence,
 `fonts/LICENSE-DejaVu.txt`), Noto Sans (SIL Open Font License 1.1,
 `fonts/LICENSE-Noto.txt`).
